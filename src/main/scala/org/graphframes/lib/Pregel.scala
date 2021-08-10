@@ -21,6 +21,8 @@ import org.graphframes.GraphFrame
 import org.graphframes.GraphFrame._
 import org.apache.spark.sql.{Column, DataFrame}
 import org.apache.spark.sql.functions.{array, col, explode, struct}
+import org.apache.spark.internal.Logging
+
 
 /**
  * Implements a Pregel-like bulk-synchronous message-passing API based on DataFrame operations.
@@ -67,7 +69,7 @@ import org.apache.spark.sql.functions.{array, col, explode, struct}
  *        Malewicz et al., Pregel: a system for large-scale graph processing.
  *      </a>
  */
-class Pregel(val graph: GraphFrame) {
+class Pregel(val graph: GraphFrame) extends Logging {
 
   private val withVertexColumnList = collection.mutable.ListBuffer.empty[(String, Column, Column)]
 
@@ -176,23 +178,25 @@ class Pregel(val graph: GraphFrame) {
    * @return the result vertex DataFrame from the final iteration including both original and additional columns.
    */
   def run(): DataFrame = {
-    require(sendMsgs.length > 0, "We need to set at least one message expression for pregel running.")
+    print("Starting Pregel, version 4\n")
+    logWarning("Starting Pregel...")
+    require(sendMsgs.nonEmpty, "We need to set at least one message expression for pregel running.")
     require(aggMsgsCol != null, "We need to set aggMsgs for pregel running.")
     require(maxIter >= 1, "The max iteration number should be >= 1.")
     require(checkpointInterval >= 0, "The checkpoint interval should be >= 0, 0 indicates no checkpoint.")
-    require(withVertexColumnList.size > 0, "There should be at least one additional vertex columns for updating.")
-
+    require(withVertexColumnList.nonEmpty, "There should be at least one additional vertex columns for updating.")
+    // Create a list of pairs of columns: the id column and a column with the message expression
     val sendMsgsColList = sendMsgs.toList.map { case (id, msg) =>
       struct(id.as(ID), msg.as("msg"))
     }
-
+    // Create a list of columns, which contain the initialise expression, with the new column name
     val initVertexCols = withVertexColumnList.toList.map { case (colName, initExpr, _) =>
       initExpr.as(colName)
     }
     val updateVertexCols = withVertexColumnList.toList.map { case (colName, _, updateExpr) =>
-      updateExpr.as(colName)
+      updateExpr.as(colName) // Update expressions with the new column name
     }
-
+    // :: concatenates a list, and :_* is like a spread operator, so here we select all columns (?) and the column with init expressions
     var currentVertices = graph.vertices.select((col("*") :: initVertexCols): _*)
     var vertexUpdateColDF: DataFrame = null
 
@@ -203,30 +207,51 @@ class Pregel(val graph: GraphFrame) {
     val shouldCheckpoint = checkpointInterval > 0
 
     while (iteration <= maxIter) {
+      // Create a dataframe with src, edge and dst columns (which are all struct columns containing the user-defined columns)
+      logWarning("Starting iteration " + iteration)
+
+      // Create a struct column named src, containing all the vertex columns including the computation column with (initially) init expressions
       val tripletsDF = currentVertices.select(struct(col("*")).as(SRC))
+        // Join with struct column for edge columns
         .join(edges.select(struct(col("*")).as(EDGE)), Pregel.src(ID) === Pregel.edge(SRC))
         .join(currentVertices.select(struct(col("*")).as(DST)), Pregel.edge(DST) === Pregel.dst(ID))
+      logWarning("tripletsDF: " + tripletsDF.rdd.collect().mkString("Array(", ", ", ")"))
 
-      var msgDF: DataFrame = tripletsDF
-        .select(explode(array(sendMsgsColList: _*)).as("msg"))
+      // For the data (rows) in the triplets DF, create a DF with only vertex id and message expression columns
+      // todo should only send messages for active vertices!
+      val msgDF: DataFrame = tripletsDF
+        .select(explode(array(sendMsgsColList: _*)).as("msg")) // Add msg column, with the message expressions?
         .select(col("msg.id"), col("msg.msg").as(Pregel.MSG_COL_NAME))
+      logWarning("msgDF: " + msgDF.rdd.collect().mkString("Array(", ", ", ")"))
 
+      // Aggregate messages per vertex (this will also filter out 0 messages in case the aggregation is addition)
       val newAggMsgDF = msgDF
-        .filter(Pregel.msg.isNotNull)
+        .filter(Pregel.msg.isNotNull) // Pregel.msg references Pregel.MSG_COL_NAME as a column. todo how can msg expression be evaluated when msgDF has only id and msg columns?
         .groupBy(ID)
         .agg(aggMsgsCol.as(Pregel.MSG_COL_NAME))
+      logWarning("newAggMsgDF: " + newAggMsgDF.rdd.collect().mkString("Array(", ", ", ")"))
 
+      // Stop if no more messages are sent
+      if (newAggMsgDF.count() == 0) {
+        iteration = maxIter
+      }
+
+      // Left outer join the vertices with the messages (so vertices without a message get a null there)
+      // todo possible speedup by only computing update for non-null messages?
       val verticesWithMsg = currentVertices.join(newAggMsgDF, Seq(ID), "left_outer")
+      logWarning("verticesWithMsg: " + verticesWithMsg.rdd.collect().mkString("Array(", ", ", ")"))
 
+      // Apply the vertex update expressions, by appending that column (since it will contain expressions based on the other non-selected columns)
       var newVertexUpdateColDF = verticesWithMsg.select((col(ID) :: updateVertexCols): _*)
+      logWarning("newVertexUpdateColDF: " + newVertexUpdateColDF.rdd.collect().mkString("Array(", ", ", ")"))
 
       if (shouldCheckpoint && iteration % checkpointInterval == 0) {
         // do checkpoint, use lazy checkpoint because later we will materialize this DF.
         newVertexUpdateColDF = newVertexUpdateColDF.checkpoint(eager = false)
         // TODO: remove last checkpoint file.
       }
-      newVertexUpdateColDF.cache()
-      newVertexUpdateColDF.count() // materialize it
+      newVertexUpdateColDF.cache() // todo this caching costs a lot of time right, but is it useful?
+      newVertexUpdateColDF.count() // materialize it (something with hiding old messages? see graphx implementation)
 
       if (vertexUpdateColDF != null) {
         vertexUpdateColDF.unpersist()
@@ -234,7 +259,8 @@ class Pregel(val graph: GraphFrame) {
       vertexUpdateColDF = newVertexUpdateColDF
 
       currentVertices = graph.vertices.join(vertexUpdateColDF, ID)
-
+      logWarning("currentVertices: " + currentVertices.rdd.collect().mkString("Array(", ", ", ")"))
+      // todo we always do maxIter iterations?
       iteration += 1
     }
 
