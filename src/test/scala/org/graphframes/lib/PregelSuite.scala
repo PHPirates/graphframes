@@ -69,14 +69,18 @@ class PregelSuite extends SparkFunSuite with GraphFrameTestSparkContext {
     val graph = GraphFrame(verDF, edgeDF)
 
     val resultDF = graph.pregel
-      .setMaxIter(n - 1)
+      .setMaxIter(2*n)
+      // The vertex with id 1 starts with value 1, rest starts with 0
       .withVertexColumn("value",
         when(col("id") === lit(1), lit(1)).otherwise(lit(0)),
+        // Update when receiving a larger value
         when(Pregel.msg > col("value"), Pregel.msg).otherwise(col("value"))
       )
       .sendMsgToDst(
+        // Only send message if the value is different
         when(Pregel.dst("value") =!= Pregel.src("value"), Pregel.src("value"))
       )
+      // Propagate the value 1 to other vertices
       .aggMsgs(max(Pregel.msg))
       .run()
 
@@ -104,6 +108,36 @@ class PregelSuite extends SparkFunSuite with GraphFrameTestSparkContext {
       .run()
 
     assert(resultDF.sort("id").select("value").as[Int].collect() === Array.fill(n)(1))
+  }
+
+  test("send messages only for active vertices") {
+    val n = 5
+    val verDF = (1 to n).toDF("id").repartition(3)
+    val edgeDF = spark.sparkContext.parallelize(Seq(
+      (1, 3),
+      (2, 3),
+      (3, 4),
+      (4, 5)
+    )).toDF("src", "dst").repartition(3)
+
+    val graph = GraphFrame(verDF, edgeDF)
+
+    val resultDF = graph.pregel
+      .setMaxIter(n + 2)
+      .withVertexColumn("value",
+        // Only the leaves get a nonzero value
+        when(col("id") < lit(3), lit(42)).otherwise(lit(0)),
+        // Sum the values
+        col("value") + when(Pregel.msg.isNotNull, Pregel.msg).otherwise(0)
+      )
+      .sendMsgToDst(
+        // We don't have a way to tell if we have already sent a message, hence rely on Pregel only sending messages for active vertices (which have received a message)
+        Pregel.src("value")
+      )
+      .aggMsgs(sum(Pregel.msg))
+      .run()
+
+    assert(resultDF.sort("id").select("value").collect() === Array(42, 42, 84, 84, 84))
   }
 
 }

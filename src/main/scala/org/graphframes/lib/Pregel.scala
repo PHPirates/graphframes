@@ -178,27 +178,36 @@ class Pregel(val graph: GraphFrame) extends Logging {
    * @return the result vertex DataFrame from the final iteration including both original and additional columns.
    */
   def run(): DataFrame = {
-    print("Starting Pregel, version 4\n")
+    print("Starting Pregel, version 5\n")
     logWarning("Starting Pregel...")
     require(sendMsgs.nonEmpty, "We need to set at least one message expression for pregel running.")
     require(aggMsgsCol != null, "We need to set aggMsgs for pregel running.")
     require(maxIter >= 1, "The max iteration number should be >= 1.")
     require(checkpointInterval >= 0, "The checkpoint interval should be >= 0, 0 indicates no checkpoint.")
     require(withVertexColumnList.nonEmpty, "There should be at least one additional vertex columns for updating.")
+
     // Create a list of pairs of columns: the id column and a column with the message expression
+    // If sending messages from src to dst, then the id will be the dstId
     val sendMsgsColList = sendMsgs.toList.map { case (id, msg) =>
       struct(id.as(ID), msg.as("msg"))
     }
+
     // Create a list of columns, which contain the initialise expression, with the new column name
     val initVertexCols = withVertexColumnList.toList.map { case (colName, initExpr, _) =>
       initExpr.as(colName)
     }
+
     val updateVertexCols = withVertexColumnList.toList.map { case (colName, _, updateExpr) =>
       updateExpr.as(colName) // Update expressions with the new column name
     }
+
     // :: concatenates a list, and :_* is like a spread operator, so here we select all columns (?) and the column with init expressions
     var currentVertices = graph.vertices.select((col("*") :: initVertexCols): _*)
+
     var vertexUpdateColDF: DataFrame = null
+
+    // Maintain which messages were sent in the previous iteration
+    var previousAggMsgDF: DataFrame = null
 
     val edges = graph.edges
 
@@ -208,47 +217,70 @@ class Pregel(val graph: GraphFrame) extends Logging {
 
     while (iteration <= maxIter) {
       // Create a dataframe with src, edge and dst columns (which are all struct columns containing the user-defined columns)
-      logWarning("Starting iteration " + iteration)
+      print("--------------- Starting iteration " + iteration + "---------------\n")
 
       // Create a struct column named src, containing all the vertex columns including the computation column with (initially) init expressions
       val tripletsDF = currentVertices.select(struct(col("*")).as(SRC))
         // Join with struct column for edge columns
         .join(edges.select(struct(col("*")).as(EDGE)), Pregel.src(ID) === Pregel.edge(SRC))
         .join(currentVertices.select(struct(col("*")).as(DST)), Pregel.edge(DST) === Pregel.dst(ID))
-      logWarning("tripletsDF: " + tripletsDF.rdd.collect().mkString("Array(", ", ", ")"))
+      // [[srcId, srcValues], [srcId, dstId, edgeValues], [dstId, dstValues]]
+      print("tripletsDF:\n")
+      tripletsDF.show(false)
 
       // For the data (rows) in the triplets DF, create a DF with only vertex id and message expression columns
-      // todo should only send messages for active vertices!
-      val msgDF: DataFrame = tripletsDF
-        .select(explode(array(sendMsgsColList: _*)).as("msg")) // Add msg column, with the message expressions?
+      // We should only send new messages for vertices that are active, so we should first filter the triplets
+      // on their vertex-sending side (src or dst) that were active (received a message) in the previous iteration.
+      // TODO at this point we do not have the information in which direction we are sending messages,
+      val activeTripletsDF = if (previousAggMsgDF == null) tripletsDF else tripletsDF
+        .withColumn("id", col("src.id")).join(previousAggMsgDF, "id").drop("id")
+      print("activeTripletsDF:\n")
+      activeTripletsDF.show(false)
+
+      val msgDF: DataFrame = activeTripletsDF
+        // Create a struct column with the id and message columns
+        .select(explode(array(sendMsgsColList: _*)).as("msg")) // Add msg column, with the message expressions
+        // Explode the single 'msg' struct column to two columns
         .select(col("msg.id"), col("msg.msg").as(Pregel.MSG_COL_NAME))
-      logWarning("msgDF: " + msgDF.rdd.collect().mkString("Array(", ", ", ")"))
+      // [[vertexId, message], ...] (the vertex which receives the message)
+      print("msgDF:\n")
+      msgDF.show(false)
 
       // Aggregate messages per vertex (this will also filter out 0 messages in case the aggregation is addition)
       val newAggMsgDF = msgDF
-        .filter(Pregel.msg.isNotNull) // Pregel.msg references Pregel.MSG_COL_NAME as a column. todo how can msg expression be evaluated when msgDF has only id and msg columns?
+        .filter(Pregel.msg.isNotNull) // Pregel.msg references Pregel.MSG_COL_NAME as a column.
         .groupBy(ID)
         .agg(aggMsgsCol.as(Pregel.MSG_COL_NAME))
-      logWarning("newAggMsgDF: " + newAggMsgDF.rdd.collect().mkString("Array(", ", ", ")"))
+      print("newAggMsgDF:\n")
+      newAggMsgDF.show(false)
+
+      // Give this information to the next iteration
+      if (previousAggMsgDF != null) {
+        previousAggMsgDF.unpersist()
+      }
+      previousAggMsgDF = newAggMsgDF
 
       // Stop if no more messages are sent
       if (newAggMsgDF.count() == 0) {
+        print("No more messages, stopping.")
         iteration = maxIter
       }
 
       // Left outer join the vertices with the messages (so vertices without a message get a null there)
-      // todo possible speedup by only computing update for non-null messages?
+      // TODO possible speedup by only computing update for non-null messages?
       val verticesWithMsg = currentVertices.join(newAggMsgDF, Seq(ID), "left_outer")
-      logWarning("verticesWithMsg: " + verticesWithMsg.rdd.collect().mkString("Array(", ", ", ")"))
+      print("verticesWithMsg:\n")
+      verticesWithMsg.show(false)
 
       // Apply the vertex update expressions, by appending that column (since it will contain expressions based on the other non-selected columns)
       var newVertexUpdateColDF = verticesWithMsg.select((col(ID) :: updateVertexCols): _*)
-      logWarning("newVertexUpdateColDF: " + newVertexUpdateColDF.rdd.collect().mkString("Array(", ", ", ")"))
+      print("newVertexUpdateColDF:\n")
+      newVertexUpdateColDF.show(false)
 
       if (shouldCheckpoint && iteration % checkpointInterval == 0) {
         // do checkpoint, use lazy checkpoint because later we will materialize this DF.
         newVertexUpdateColDF = newVertexUpdateColDF.checkpoint(eager = false)
-        // TODO: remove last checkpoint file.
+        // TODO remove last checkpoint file.
       }
       newVertexUpdateColDF.cache() // todo this caching costs a lot of time right, but is it useful?
       newVertexUpdateColDF.count() // materialize it (something with hiding old messages? see graphx implementation)
@@ -259,8 +291,8 @@ class Pregel(val graph: GraphFrame) extends Logging {
       vertexUpdateColDF = newVertexUpdateColDF
 
       currentVertices = graph.vertices.join(vertexUpdateColDF, ID)
-      logWarning("currentVertices: " + currentVertices.rdd.collect().mkString("Array(", ", ", ")"))
-      // todo we always do maxIter iterations?
+      print("currentVertices:\n")
+      currentVertices.show(false)
       iteration += 1
     }
 
