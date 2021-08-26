@@ -17,6 +17,7 @@
 
 package org.graphframes.lib
 
+import org.apache.spark.graphx.EdgeDirection
 import org.graphframes.GraphFrame
 import org.graphframes.GraphFrame._
 import org.apache.spark.sql.{Column, DataFrame}
@@ -76,7 +77,9 @@ class Pregel(val graph: GraphFrame) extends Logging {
   private var maxIter: Int = 10
   private var checkpointInterval = 2
 
-  private var sendMsgs = collection.mutable.ListBuffer.empty[(Column, Column)]
+  // Vertex id (can be src or dst) and message expression columns
+  private val sendMsgs = collection.mutable.ListBuffer.empty[(Column, Column, Column)]
+
   private var aggMsgsCol: Column = null
 
   private val CHECKPOINT_NAME_PREFIX = "pregel"
@@ -139,7 +142,8 @@ class Pregel(val graph: GraphFrame) extends Logging {
    * @see [[sendMsgToDst]]
    */
   def sendMsgToSrc(msgExpr: Column): this.type = {
-    sendMsgs += Tuple2(Pregel.src(ID), msgExpr)
+    // (message source, message destination, message expression)
+    sendMsgs += Tuple3(Pregel.dst(ID), Pregel.src(ID), msgExpr)
     this
   }
 
@@ -156,7 +160,8 @@ class Pregel(val graph: GraphFrame) extends Logging {
    * @see [[sendMsgToSrc]]
    */
   def sendMsgToDst(msgExpr: Column): this.type = {
-    sendMsgs += Tuple2(Pregel.dst(ID), msgExpr)
+    // (message source, message destination, message expression)
+    sendMsgs += Tuple3(Pregel.src(ID), Pregel.dst(ID), msgExpr)
     this
   }
 
@@ -178,8 +183,9 @@ class Pregel(val graph: GraphFrame) extends Logging {
    * @return the result vertex DataFrame from the final iteration including both original and additional columns.
    */
   def run(): DataFrame = {
-    print("Starting Pregel, version 5\n")
-    logWarning("Starting Pregel...")
+    logWarning("Starting Pregel, version 5\n")
+    val logging = false
+
     require(sendMsgs.nonEmpty, "We need to set at least one message expression for pregel running.")
     require(aggMsgsCol != null, "We need to set aggMsgs for pregel running.")
     require(maxIter >= 1, "The max iteration number should be >= 1.")
@@ -188,8 +194,9 @@ class Pregel(val graph: GraphFrame) extends Logging {
 
     // Create a list of pairs of columns: the id column and a column with the message expression
     // If sending messages from src to dst, then the id will be the dstId
-    val sendMsgsColList = sendMsgs.toList.map { case (id, msg) =>
-      struct(id.as(ID), msg.as("msg"))
+    val sendMsgsColList = sendMsgs.toList.map { case (msgSrc, msgDst, msg) =>
+      // Give the expressions a name
+      struct(msgSrc.as("msgSrc"), msgDst.as(ID), msg.as("msg"))
     }
 
     // Create a list of columns, which contain the initialise expression, with the new column name
@@ -216,43 +223,33 @@ class Pregel(val graph: GraphFrame) extends Logging {
     val shouldCheckpoint = checkpointInterval > 0
 
     while (iteration <= maxIter) {
-      // Create a dataframe with src, edge and dst columns (which are all struct columns containing the user-defined columns)
-      print("--------------- Starting iteration " + iteration + "---------------\n")
+      if (logging) print("--------------- Starting iteration " + iteration + "---------------\n")
 
+      // Create a dataframe with src, edge and dst columns (which are all struct columns containing the user-defined columns)
       // Create a struct column named src, containing all the vertex columns including the computation column with (initially) init expressions
       val tripletsDF = currentVertices.select(struct(col("*")).as(SRC))
         // Join with struct column for edge columns
         .join(edges.select(struct(col("*")).as(EDGE)), Pregel.src(ID) === Pregel.edge(SRC))
         .join(currentVertices.select(struct(col("*")).as(DST)), Pregel.edge(DST) === Pregel.dst(ID))
-      // [[srcId, srcValues], [srcId, dstId, edgeValues], [dstId, dstValues]]
-      print("tripletsDF:\n")
-      tripletsDF.show(false)
+      // Result: [[srcId, srcValues], [srcId, dstId, edgeValues], [dstId, dstValues]]
 
-      // For the data (rows) in the triplets DF, create a DF with only vertex id and message expression columns
-      // We should only send new messages for vertices that are active, so we should first filter the triplets
-      // on their vertex-sending side (src or dst) that were active (received a message) in the previous iteration.
-      // TODO at this point we do not have the information in which direction we are sending messages,
-      val activeTripletsDF = if (previousAggMsgDF == null) tripletsDF else tripletsDF
-        .withColumn("id", col("src.id")).join(previousAggMsgDF, "id").drop("id")
-      print("activeTripletsDF:\n")
-      activeTripletsDF.show(false)
-
-      val msgDF: DataFrame = activeTripletsDF
-        // Create a struct column with the id and message columns
-        .select(explode(array(sendMsgsColList: _*)).as("msg")) // Add msg column, with the message expressions
+      val msgDF: DataFrame = tripletsDF
+        // Add a struct column called 'msg' with the id and message expression columns
+        // So suppose we are sending a message from src to dst, then the first column (for that row) in sendMsgsColList will be "dst.id AS `id`", so after the following line, that "dst.id" expression will evaluate to the actual vertex id
+        .select(explode(array(sendMsgsColList: _*)).as("msg"))
         // Explode the single 'msg' struct column to two columns
-        .select(col("msg.id"), col("msg.msg").as(Pregel.MSG_COL_NAME))
-      // [[vertexId, message], ...] (the vertex which receives the message)
-      print("msgDF:\n")
-      msgDF.show(false)
+        .select(col("msg.msgSrc"), col("msg.id"), col("msg.msg").as(Pregel.MSG_COL_NAME))
+      // [[message source vertex id "msgSrc", message destination vertex id "id", message], ...]
+
+      // Now use the fact that we know the source (msgSrc) vertex id for each message, to filter on active vertices, as messages should only be sent from active vertices
+      // Temporarily rename "id" to "msgSrc" to do the join
+      val activeMsgDF = if (previousAggMsgDF == null) msgDF else msgDF.join(previousAggMsgDF.drop(Pregel.MSG_COL_NAME).withColumnRenamed("id", "msgSrc"), "msgSrc")
 
       // Aggregate messages per vertex (this will also filter out 0 messages in case the aggregation is addition)
-      val newAggMsgDF = msgDF
+      val newAggMsgDF = activeMsgDF
         .filter(Pregel.msg.isNotNull) // Pregel.msg references Pregel.MSG_COL_NAME as a column.
         .groupBy(ID)
         .agg(aggMsgsCol.as(Pregel.MSG_COL_NAME))
-      print("newAggMsgDF:\n")
-      newAggMsgDF.show(false)
 
       // Give this information to the next iteration
       if (previousAggMsgDF != null) {
@@ -260,22 +257,29 @@ class Pregel(val graph: GraphFrame) extends Logging {
       }
       previousAggMsgDF = newAggMsgDF
 
+      if (logging) {
+        print("tripletsDF:\n")
+        tripletsDF.show(false)
+        print("msgDF:\n")
+        msgDF.show(false)
+        print("activeMsgDF:\n")
+        activeMsgDF.show(false)
+        print("newAggMsgDF:\n")
+        newAggMsgDF.show(false)
+      }
+
       // Stop if no more messages are sent
       if (newAggMsgDF.count() == 0) {
-        print("No more messages, stopping.")
+        if (logging) print("No more messages, stopping.")
         iteration = maxIter
       }
 
       // Left outer join the vertices with the messages (so vertices without a message get a null there)
       // TODO possible speedup by only computing update for non-null messages?
       val verticesWithMsg = currentVertices.join(newAggMsgDF, Seq(ID), "left_outer")
-      print("verticesWithMsg:\n")
-      verticesWithMsg.show(false)
 
       // Apply the vertex update expressions, by appending that column (since it will contain expressions based on the other non-selected columns)
       var newVertexUpdateColDF = verticesWithMsg.select((col(ID) :: updateVertexCols): _*)
-      print("newVertexUpdateColDF:\n")
-      newVertexUpdateColDF.show(false)
 
       if (shouldCheckpoint && iteration % checkpointInterval == 0) {
         // do checkpoint, use lazy checkpoint because later we will materialize this DF.
@@ -291,8 +295,16 @@ class Pregel(val graph: GraphFrame) extends Logging {
       vertexUpdateColDF = newVertexUpdateColDF
 
       currentVertices = graph.vertices.join(vertexUpdateColDF, ID)
-      print("currentVertices:\n")
-      currentVertices.show(false)
+
+      if (logging) {
+        print("verticesWithMsg:\n")
+        verticesWithMsg.show(false)
+        print("newVertexUpdateColDF:\n")
+        newVertexUpdateColDF.show(false)
+        print("currentVertices:\n")
+        currentVertices.show(false)
+      }
+
       iteration += 1
     }
 

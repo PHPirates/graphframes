@@ -137,7 +137,7 @@ class PregelSuite extends SparkFunSuite with GraphFrameTestSparkContext {
       .aggMsgs(sum(Pregel.msg))
       .run()
 
-    assert(resultDF.sort("id").select("value").collect() === Array(42, 42, 84, 84, 84))
+    assert(resultDF.sort("id").select("value").collect().map(r => r.get(0)) === Array(42, 42, 84, 84, 84))
   }
 
 }
