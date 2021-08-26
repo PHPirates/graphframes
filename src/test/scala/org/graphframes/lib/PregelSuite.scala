@@ -33,7 +33,8 @@ class PregelSuite extends SparkFunSuite with GraphFrameTestSparkContext {
       (1L, 2L),
       (2L, 4L),
       (2L, 0L),
-      (3L, 4L), // 3 has no in-links
+      (3L, 4L),
+      (4L, 3L),
       (4L, 0L),
       (4L, 2L)
     ).toDF("src", "dst").cache()
@@ -42,7 +43,7 @@ class PregelSuite extends SparkFunSuite with GraphFrameTestSparkContext {
     val graph = GraphFrame(vertices, edges)
 
     val alpha = 0.15
-    // NOTE: This version doesn't handle nodes with no out-links.
+    // NOTE: This version doesn't handle nodes with no out-links, and nodes with no in-links
     val ranks = graph.pregel
       .setMaxIter(5)
       .withVertexColumn("rank", lit(1.0 / numVertices),
@@ -54,7 +55,7 @@ class PregelSuite extends SparkFunSuite with GraphFrameTestSparkContext {
     val result = ranks.sort(col("id"))
       .select("rank").as[Double].collect()
     assert(result.sum === 1.0 +- 1e-6)
-    val expected = Seq(0.245, 0.224, 0.303, 0.03, 0.197)
+    val expected = Seq(0.209, 0.200, 0.266, 0.089, 0.234)
     result.zip(expected).foreach { case (r, e) =>
       assert(r === e +- 1e-3)
     }
@@ -134,6 +135,31 @@ class PregelSuite extends SparkFunSuite with GraphFrameTestSparkContext {
         // We don't have a way to tell if we have already sent a message, hence rely on Pregel only sending messages for active vertices (which have received a message)
         Pregel.src("value")
       )
+      .aggMsgs(sum(Pregel.msg))
+      .run()
+
+    assert(resultDF.sort("id").select("value").collect().map(r => r.get(0)) === Array(42, 42, 84, 84, 84))
+  }
+
+  test("send messages only for active vertices, reversed") {
+    val n = 5
+    val verDF = (1 to n).toDF("id").repartition(3)
+    val edgeDF = spark.sparkContext.parallelize(Seq(
+      (3, 1),
+      (3, 2),
+      (4, 3),
+      (5, 4)
+    )).toDF("src", "dst").repartition(3)
+
+    val graph = GraphFrame(verDF, edgeDF)
+
+    val resultDF = graph.pregel
+      .setMaxIter(n + 2)
+      .withVertexColumn("value",
+        when(col("id") < lit(3), lit(42)).otherwise(lit(0)),
+        col("value") + when(Pregel.msg.isNotNull, Pregel.msg).otherwise(0)
+      )
+      .sendMsgToSrc(Pregel.dst("value"))
       .aggMsgs(sum(Pregel.msg))
       .run()
 

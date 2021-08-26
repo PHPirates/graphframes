@@ -297,12 +297,12 @@ class Pregel(val graph: GraphFrame) extends Logging {
       currentVertices = graph.vertices.join(vertexUpdateColDF, ID)
 
       if (logging) {
-        print("verticesWithMsg:\n")
-        verticesWithMsg.show(false)
-        print("newVertexUpdateColDF:\n")
-        newVertexUpdateColDF.show(false)
+//        print("verticesWithMsg:\n")
+//        verticesWithMsg.show(false)
+//        print("newVertexUpdateColDF:\n")
+//        newVertexUpdateColDF.show(false)
         print("currentVertices:\n")
-        currentVertices.show(false)
+        currentVertices.sort(col("id")).show(false)
       }
 
       iteration += 1
