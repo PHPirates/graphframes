@@ -166,7 +166,6 @@ class PregelSuite extends SparkFunSuite with GraphFrameTestSparkContext {
     assert(resultDF.sort("id").select("value").collect().map(r => r.get(0)) === Array(42, 42, 84, 84, 84))
     val duration = (System.nanoTime() - startTime) / 1e9d
     println(s"Spark computation took ${"%.1f".format(duration)} seconds.")
-    while(true){}
   }
 
 }
