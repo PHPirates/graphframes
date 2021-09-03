@@ -18,9 +18,7 @@
 package org.graphframes.lib
 
 import org.scalactic.Tolerance._
-
 import org.apache.spark.sql.functions._
-
 import org.graphframes._
 
 class PregelSuite extends SparkFunSuite with GraphFrameTestSparkContext {
@@ -153,6 +151,8 @@ class PregelSuite extends SparkFunSuite with GraphFrameTestSparkContext {
 
     val graph = GraphFrame(verDF, edgeDF)
 
+    val startTime = System.nanoTime()
+
     val resultDF = graph.pregel
       .setMaxIter(n + 2)
       .withVertexColumn("value",
@@ -164,6 +164,9 @@ class PregelSuite extends SparkFunSuite with GraphFrameTestSparkContext {
       .run()
 
     assert(resultDF.sort("id").select("value").collect().map(r => r.get(0)) === Array(42, 42, 84, 84, 84))
+    val duration = (System.nanoTime() - startTime) / 1e9d
+    println(s"Spark computation took ${"%.1f".format(duration)} seconds.")
+    while(true){}
   }
 
 }

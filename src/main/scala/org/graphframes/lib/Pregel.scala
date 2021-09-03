@@ -183,7 +183,7 @@ class Pregel(val graph: GraphFrame) extends Logging {
    * @return the result vertex DataFrame from the final iteration including both original and additional columns.
    */
   def run(): DataFrame = {
-    logWarning("Starting Pregel, version 5\n")
+    logWarning("Starting Pregel, version 9\n")
     val logging = false
 
     require(sendMsgs.nonEmpty, "We need to set at least one message expression for pregel running.")
@@ -270,7 +270,7 @@ class Pregel(val graph: GraphFrame) extends Logging {
 
       // Stop if no more messages are sent
       if (newAggMsgDF.count() == 0) {
-        if (logging) print("No more messages, stopping.")
+        if (logging) logWarning("No more messages, stopping.")
         iteration = maxIter
       }
 
@@ -286,7 +286,7 @@ class Pregel(val graph: GraphFrame) extends Logging {
         newVertexUpdateColDF = newVertexUpdateColDF.checkpoint(eager = false)
         // TODO remove last checkpoint file.
       }
-      newVertexUpdateColDF.cache() // todo this caching costs a lot of time right, but is it useful?
+      newVertexUpdateColDF.cache()
       newVertexUpdateColDF.count() // materialize it (something with hiding old messages? see graphx implementation)
 
       if (vertexUpdateColDF != null) {
@@ -297,10 +297,10 @@ class Pregel(val graph: GraphFrame) extends Logging {
       currentVertices = graph.vertices.join(vertexUpdateColDF, ID)
 
       if (logging) {
-//        print("verticesWithMsg:\n")
-//        verticesWithMsg.show(false)
-//        print("newVertexUpdateColDF:\n")
-//        newVertexUpdateColDF.show(false)
+        print("verticesWithMsg:\n")
+        verticesWithMsg.show(false)
+        print("newVertexUpdateColDF:\n")
+        newVertexUpdateColDF.show(false)
         print("currentVertices:\n")
         currentVertices.sort(col("id")).show(false)
       }
